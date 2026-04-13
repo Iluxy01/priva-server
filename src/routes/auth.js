@@ -12,9 +12,9 @@ router.post('/register', async (req, res) => {
     return res.status(400).json({ error: 'username, display_name and password are required' });
   }
 
-  if (!/^[a-z0-9_]{3,32}$/.test(username)) {
+  if (!/^[a-z0-9_.]{3,32}$/.test(username)) {
     return res.status(400).json({
-      error: 'Username: only lowercase letters, numbers, underscore. 3-32 chars.'
+      error: 'Username: only lowercase letters, numbers, underscore or dot. 3-32 chars.'
     });
   }
 
