@@ -11,19 +11,16 @@ router.get('/search', authMiddleware, async (req, res) => {
   }
 
   try {
-    // public_key включён — клиент сохраняет его сразу при поиске,
-    // чтобы шифрование работало уже при первом сообщении
     const result = await pool.query(
-      `SELECT id, username, display_name, public_key, avatar_url, status, last_seen
+      `SELECT id, username, display_name, avatar_url, status, last_seen
        FROM users
        WHERE username ILIKE $1 AND id != $2
        LIMIT 20`,
       [`%${q}%`, req.userId]
     );
-    console.log(`[users/search] query="${q}" found=${result.rows.length} (caller=${req.userId})`);
     res.json({ users: result.rows });
   } catch (err) {
-    console.error('[users/search] error:', err);
+    console.error('Search error:', err);
     res.status(500).json({ error: 'Search failed' });
   }
 });
@@ -36,11 +33,8 @@ router.get('/me', authMiddleware, async (req, res) => {
       [req.userId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const user = result.rows[0];
-    console.log(`[users/me] userId=${req.userId} hasPublicKey=${!!user.public_key}`);
-    res.json({ user });
+    res.json({ user: result.rows[0] });
   } catch (err) {
-    console.error('[users/me] error:', err);
     res.status(500).json({ error: 'Failed to fetch user' });
   }
 });
@@ -53,11 +47,8 @@ router.get('/:id', authMiddleware, async (req, res) => {
       [req.params.id]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
-    const user = result.rows[0];
-    console.log(`[users/:id] id=${req.params.id} hasPublicKey=${!!user.public_key} (caller=${req.userId})`);
-    res.json({ user });
+    res.json({ user: result.rows[0] });
   } catch (err) {
-    console.error('[users/:id] error:', err);
     res.status(500).json({ error: 'Failed to fetch user' });
   }
 });
@@ -79,14 +70,12 @@ router.put('/me', authMiddleware, async (req, res) => {
   values.push(req.userId);
   try {
     const result = await pool.query(
-      `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx}
+      `UPDATE users SET ${updates.join(', ')} WHERE id = $${idx} 
        RETURNING id, username, display_name, avatar_url, status`,
       values
     );
-    console.log(`[users/put/me] updated userId=${req.userId} fields=${updates.join(',')}`);
     res.json({ user: result.rows[0] });
   } catch (err) {
-    console.error('[users/put/me] error:', err);
     res.status(500).json({ error: 'Update failed' });
   }
 });
