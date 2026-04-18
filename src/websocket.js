@@ -47,7 +47,7 @@ function setupWebSocket(server) {
         case 'message': {
           const { chat_id, temp_id, encrypted_content, media_type, iv, recipient_ids } = msg;
 
-          if (!chat_id || !encrypted_content || !Array.isArray(recipient_ids)) break;
+          if (!chat_id || encrypted_content === undefined || encrypted_content === null || !Array.isArray(recipient_ids)) break;
 
           // Verify sender is in the chat
           const memberCheck = await pool.query(
