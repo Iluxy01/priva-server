@@ -67,10 +67,18 @@ function setupWebSocket(server) {
             sent_at: new Date().toISOString(),
           };
 
-          // Deliver to all recipients that are online
+          // Проверяем, что все recipient_ids — реальные участники чата
+          const memberRows = await pool.query(
+            `SELECT user_id FROM chat_members WHERE chat_id = $1`,
+            [chat_id]
+          );
+          const chatMemberIds = new Set(memberRows.rows.map(r => String(r.user_id)));
+
+          // Deliver to all recipients that are online (only verified chat members)
           let delivered = false;
           for (const rid of recipient_ids) {
             if (String(rid) === userId) continue;
+            if (!chatMemberIds.has(String(rid))) continue; // не участник — игнорируем
             delivered = sendToUser(String(rid), envelope) || delivered;
           }
 
