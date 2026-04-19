@@ -11,14 +11,7 @@ const { setupWebSocket } = require('./websocket');
 const app = express();
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-// CORS: задай CORS_ORIGIN=https://твой-сайт.com в переменных окружения Render.
-// Если переменная не задана — браузерные cross-origin запросы блокируются
-// (нативные мобильные клиенты CORS не используют и работают без изменений).
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || false,
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 
 // ── Health check ──────────────────────────────────────────────────────────────

@@ -5,209 +5,150 @@ const { pool } = require('./db');
 // Map: userId (string) → Set of WebSocket connections
 const clients = new Map();
 
-// ── Лимит сообщений: не более 30 типа 'message' за 10 секунд на пользователя ──
-const msgRateLimits = new Map(); // userId → { count, resetAt }
-
-function checkMessageRateLimit(userId) {
-  const now = Date.now();
-  let entry = msgRateLimits.get(userId);
-  if (!entry || now >= entry.resetAt) {
-    entry = { count: 0, resetAt: now + 10_000 };
-    msgRateLimits.set(userId, entry);
-  }
-  entry.count++;
-  return entry.count <= 30;
-}
-
 function setupWebSocket(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
-  wss.on('connection', (ws) => {
-    // ── Шаг 1: ждём первое сообщение с токеном ─────────────────────────────
-    // Токен больше не передаётся в URL (не попадает в логи сервера).
-    // Клиент обязан прислать { type: "auth", token: "..." } в течение 5 секунд.
+  wss.on('connection', async (ws, req) => {
+    // ── Authenticate via token in query string ──────────────────────────────
+    const url = new URL(req.url, 'http://localhost');
+    const token = url.searchParams.get('token');
 
     let userId;
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+      userId = String(payload.userId);
+    } catch {
+      ws.close(4001, 'Unauthorized');
+      return;
+    }
 
-    const authTimeout = setTimeout(() => {
-      ws.close(4001, 'Auth timeout');
-    }, 5000);
+    // Register connection
+    if (!clients.has(userId)) clients.set(userId, new Set());
+    clients.get(userId).add(ws);
 
-    ws.once('message', async (data) => {
-      // Разбираем первое сообщение
+    // Update last_seen + notify contacts
+    await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [userId]);
+    broadcastPresence(userId, 'online');
+
+    console.log(`✅ User ${userId} connected (${clients.get(userId).size} connections)`);
+
+    // ── Handle incoming messages ────────────────────────────────────────────
+    ws.on('message', async (data) => {
       let msg;
       try {
         msg = JSON.parse(data.toString());
       } catch {
-        clearTimeout(authTimeout);
-        ws.close(4001, 'Invalid auth message');
-        return;
+        return; // Ignore malformed JSON
       }
 
-      if (msg.type !== 'auth' || !msg.token) {
-        clearTimeout(authTimeout);
-        ws.close(4001, 'Expected auth message');
-        return;
-      }
+      switch (msg.type) {
 
-      // Проверяем JWT
-      try {
-        const payload = jwt.verify(msg.token, process.env.JWT_SECRET);
-        userId = String(payload.userId);
-      } catch {
-        clearTimeout(authTimeout);
-        ws.close(4001, 'Unauthorized');
-        return;
-      }
+        // ── Relay chat message (NOT stored on server) ──────────────────────
+        case 'message': {
+          const { chat_id, temp_id, encrypted_content, media_type, iv, recipient_ids } = msg;
 
-      clearTimeout(authTimeout);
+          if (!chat_id || encrypted_content === undefined || encrypted_content === null || !Array.isArray(recipient_ids)) break;
 
-      // ── Регистрируем соединение ───────────────────────────────────────────
-      if (!clients.has(userId)) clients.set(userId, new Set());
-      clients.get(userId).add(ws);
+          // Verify sender is in the chat
+          const memberCheck = await pool.query(
+            `SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2`,
+            [chat_id, userId]
+          );
+          if (!memberCheck.rows[0]) break;
 
-      // Обновляем last_seen + уведомляем контакты
-      await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [userId]);
-      broadcastPresence(userId, 'online');
+          const envelope = {
+            type: 'message',
+            chat_id,
+            temp_id,
+            sender_id: userId,
+            encrypted_content,
+            media_type: media_type || 'text',
+            iv,
+            sent_at: new Date().toISOString(),
+          };
 
-      console.log(`✅ User ${userId} connected (${clients.get(userId).size} connections)`);
+          // Проверяем, что все recipient_ids — реальные участники чата
+          const memberRows = await pool.query(
+            `SELECT user_id FROM chat_members WHERE chat_id = $1`,
+            [chat_id]
+          );
+          const chatMemberIds = new Set(memberRows.rows.map(r => String(r.user_id)));
 
-      // Сообщаем клиенту: аутентификация прошла
-      safeSend(ws, { type: 'auth_ok' });
+          // Deliver to all recipients that are online (only verified chat members)
+          let delivered = false;
+          for (const rid of recipient_ids) {
+            if (String(rid) === userId) continue;
+            if (!chatMemberIds.has(String(rid))) continue; // не участник — игнорируем
+            delivered = sendToUser(String(rid), envelope) || delivered;
+          }
 
-      // ── Шаг 2: обрабатываем обычные сообщения ────────────────────────────
-      ws.on('message', async (data) => {
-        let msg;
-        try {
-          msg = JSON.parse(data.toString());
-        } catch {
-          return; // Игнорируем невалидный JSON
+          // ACK back to sender
+          safeSend(ws, {
+            type: 'message_ack',
+            temp_id,
+            chat_id,
+            delivered,
+            sent_at: envelope.sent_at,
+          });
+          break;
         }
 
-        switch (msg.type) {
+        // ── Typing indicator ───────────────────────────────────────────────
+        case 'typing': {
+          const { chat_id, recipient_ids, is_typing } = msg;
+          if (!chat_id || !Array.isArray(recipient_ids)) break;
 
-          // ── Ретрансляция сообщения (НЕ сохраняется на сервере) ──────────
-          case 'message': {
-            // Rate limiting: не более 30 сообщений за 10 секунд
-            if (!checkMessageRateLimit(userId)) {
-              safeSend(ws, { type: 'error', code: 'rate_limit', message: 'Too many messages' });
-              break;
-            }
-
-            const { chat_id, temp_id, encrypted_content, media_type, iv, recipient_ids } = msg;
-
-            if (!chat_id || encrypted_content === undefined || encrypted_content === null || !Array.isArray(recipient_ids)) break;
-
-            // Проверяем, что отправитель — участник чата
-            const memberCheck = await pool.query(
-              `SELECT 1 FROM chat_members WHERE chat_id = $1 AND user_id = $2`,
-              [chat_id, userId]
-            );
-            if (!memberCheck.rows[0]) break;
-
-            const envelope = {
-              type: 'message',
+          for (const rid of recipient_ids) {
+            if (String(rid) === userId) continue;
+            sendToUser(String(rid), {
+              type: 'typing',
               chat_id,
-              temp_id,
               sender_id: userId,
-              encrypted_content,
-              media_type: media_type || 'text',
-              iv,
-              sent_at: new Date().toISOString(),
-            };
-
-            // Проверяем, что все recipient_ids — реальные участники чата
-            const memberRows = await pool.query(
-              `SELECT user_id FROM chat_members WHERE chat_id = $1`,
-              [chat_id]
-            );
-            const chatMemberIds = new Set(memberRows.rows.map(r => String(r.user_id)));
-
-            // Доставляем только верифицированным участникам
-            let delivered = false;
-            for (const rid of recipient_ids) {
-              if (String(rid) === userId) continue;
-              if (!chatMemberIds.has(String(rid))) continue;
-              delivered = sendToUser(String(rid), envelope) || delivered;
-            }
-
-            // ACK отправителю
-            safeSend(ws, {
-              type: 'message_ack',
-              temp_id,
-              chat_id,
-              delivered,
-              sent_at: envelope.sent_at,
+              is_typing: !!is_typing,
             });
-            break;
           }
-
-          // ── Индикатор печати ─────────────────────────────────────────────
-          case 'typing': {
-            const { chat_id, recipient_ids, is_typing } = msg;
-            if (!chat_id || !Array.isArray(recipient_ids)) break;
-
-            for (const rid of recipient_ids) {
-              if (String(rid) === userId) continue;
-              sendToUser(String(rid), {
-                type: 'typing',
-                chat_id,
-                sender_id: userId,
-                is_typing: !!is_typing,
-              });
-            }
-            break;
-          }
-
-          // ── Уведомление о прочтении ──────────────────────────────────────
-          case 'read': {
-            const { chat_id, up_to_temp_id, sender_id } = msg;
-            if (!chat_id || !sender_id) break;
-
-            sendToUser(String(sender_id), {
-              type: 'read',
-              chat_id,
-              reader_id: userId,
-              up_to_temp_id,
-            });
-            break;
-          }
-
-          // ── Ping / keepalive ─────────────────────────────────────────────
-          case 'ping':
-            safeSend(ws, { type: 'pong' });
-            break;
+          break;
         }
-      });
 
-      // ── Отключение ─────────────────────────────────────────────────────────
-      ws.on('close', async () => {
-        msgRateLimits.delete(userId);
+        // ── Read receipt ───────────────────────────────────────────────────
+        case 'read': {
+          const { chat_id, up_to_temp_id, sender_id } = msg;
+          if (!chat_id || !sender_id) break;
 
-        const conns = clients.get(userId);
-        if (conns) {
-          conns.delete(ws);
-          if (conns.size === 0) {
-            clients.delete(userId);
-            await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [userId]);
-            broadcastPresence(userId, 'offline');
-            console.log(`👋 User ${userId} disconnected`);
-          }
+          sendToUser(String(sender_id), {
+            type: 'read',
+            chat_id,
+            reader_id: userId,
+            up_to_temp_id,
+          });
+          break;
         }
-      });
 
-      ws.on('error', (err) => console.error(`WS error for user ${userId}:`, err));
+        // ── Ping / keepalive ───────────────────────────────────────────────
+        case 'ping':
+          safeSend(ws, { type: 'pong' });
+          break;
+      }
     });
 
-    // Если соединение закрылось до аутентификации — очищаем таймаут
-    ws.on('close', () => clearTimeout(authTimeout));
-    ws.on('error', (err) => {
-      clearTimeout(authTimeout);
-      console.error('WS pre-auth error:', err);
+    // ── Disconnect ──────────────────────────────────────────────────────────
+    ws.on('close', async () => {
+      const conns = clients.get(userId);
+      if (conns) {
+        conns.delete(ws);
+        if (conns.size === 0) {
+          clients.delete(userId);
+          await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [userId]);
+          broadcastPresence(userId, 'offline');
+          console.log(`👋 User ${userId} disconnected`);
+        }
+      }
     });
+
+    ws.on('error', (err) => console.error(`WS error for user ${userId}:`, err));
   });
 
-  // ── Heartbeat: закрываем мёртвые соединения каждые 30 секунд ──────────────
+  // ── Heartbeat: close dead connections every 30s ──────────────────────────
   setInterval(() => {
     wss.clients.forEach((ws) => {
       if (ws.readyState !== WebSocket.OPEN) ws.terminate();
@@ -218,7 +159,7 @@ function setupWebSocket(server) {
   return wss;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function sendToUser(userId, payload) {
   const conns = clients.get(userId);
@@ -237,6 +178,7 @@ function safeSendRaw(ws, json) {
 }
 
 async function broadcastPresence(userId, status) {
+  // Find users who share a chat with this user
   try {
     const result = await pool.query(
       `SELECT DISTINCT cm.user_id
