@@ -1,20 +1,10 @@
 const router = require('express').Router();
 const bcrypt = require('bcryptjs');
-const rateLimit = require('express-rate-limit');
 const { pool } = require('../db');
 const { signToken } = require('../middleware/auth');
 
-// Максимум 10 попыток логина/регистрации с одного IP за 15 минут
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many attempts, please try again later' },
-});
-
 // POST /api/auth/register
-router.post('/register', authLimiter, async (req, res) => {
+router.post('/register', async (req, res) => {
   const { username, display_name, password, public_key } = req.body;
 
   // Валидация
@@ -57,7 +47,7 @@ router.post('/register', authLimiter, async (req, res) => {
 });
 
 // POST /api/auth/login
-router.post('/login', authLimiter, async (req, res) => {
+router.post('/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
@@ -108,17 +98,6 @@ const { authMiddleware } = require('../middleware/auth');
 router.post('/update-public-key', authMiddleware, async (req, res) => {
   const { public_key } = req.body;
   if (!public_key) return res.status(400).json({ error: 'public_key required' });
-
-  // Валидация: ключ должен быть JSON-строкой с полями n и e, не длиннее 4KB
-  if (typeof public_key !== 'string' || public_key.length > 4096) {
-    return res.status(400).json({ error: 'Invalid public_key format' });
-  }
-  try {
-    const parsed = JSON.parse(public_key);
-    if (!parsed.n || !parsed.e) throw new Error();
-  } catch {
-    return res.status(400).json({ error: 'Invalid public_key format' });
-  }
 
   try {
     await pool.query(

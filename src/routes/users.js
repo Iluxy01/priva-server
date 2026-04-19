@@ -12,7 +12,7 @@ router.get('/search', authMiddleware, async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, username, display_name, public_key, avatar_url, status, last_seen
+      `SELECT id, username, display_name, avatar_url, status, last_seen
        FROM users
        WHERE username ILIKE $1 AND id != $2
        LIMIT 20`,

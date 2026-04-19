@@ -47,7 +47,7 @@ function setupWebSocket(server) {
         case 'message': {
           const { chat_id, temp_id, encrypted_content, media_type, iv, recipient_ids } = msg;
 
-          if (!chat_id || encrypted_content === undefined || encrypted_content === null || !Array.isArray(recipient_ids)) break;
+          if (!chat_id || !encrypted_content || !Array.isArray(recipient_ids)) break;
 
           // Verify sender is in the chat
           const memberCheck = await pool.query(
@@ -67,18 +67,10 @@ function setupWebSocket(server) {
             sent_at: new Date().toISOString(),
           };
 
-          // Проверяем, что все recipient_ids — реальные участники чата
-          const memberRows = await pool.query(
-            `SELECT user_id FROM chat_members WHERE chat_id = $1`,
-            [chat_id]
-          );
-          const chatMemberIds = new Set(memberRows.rows.map(r => String(r.user_id)));
-
-          // Deliver to all recipients that are online (only verified chat members)
+          // Deliver to all recipients that are online
           let delivered = false;
           for (const rid of recipient_ids) {
             if (String(rid) === userId) continue;
-            if (!chatMemberIds.has(String(rid))) continue; // не участник — игнорируем
             delivered = sendToUser(String(rid), envelope) || delivered;
           }
 
