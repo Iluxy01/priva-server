@@ -1,41 +1,76 @@
-require('dotenv').config();
-const http = require('http');
+'use strict';
+
+const config = require('./config');
+const createLogger = require('./utils/logger');
+const { httpStream } = require('./utils/logger');
+const log = createLogger('Server');
+
 const express = require('express');
-const cors = require('cors');
-const { initDB } = require('./db');
-const authRouter = require('./routes/auth');
-const usersRouter = require('./routes/users');
-const chatsRouter = require('./routes/chats');
-const { setupWebSocket } = require('./websocket');
+const morgan  = require('morgan');
+const cors    = require('cors');
+const http    = require('http');
 
-const app = express();
+const { runMigrations } = require('./db/migrate');
+const { authLimiter }   = require('./middleware/rateLimit');
+const authRoutes        = require('./routes/auth');
+const usersRoutes       = require('./routes/users');
 
-// ── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+async function start() {
+  log.info('Starting Secure Messenger Server v1.0.0');
+  log.info(`Environment: ${config.NODE_ENV}`);
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+  // Run migrations
+  log.info('Running database migrations...');
+  await runMigrations();
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-app.use('/auth', authRouter);
-app.use('/users', usersRouter);
-app.use('/chats', chatsRouter);
+  const app = express();
 
-// ── 404 ───────────────────────────────────────────────────────────────────────
-app.use((_, res) => res.status(404).json({ error: 'Not found' }));
+  // HTTP request logging via morgan → our logger
+  app.use(morgan('combined', { stream: httpStream }));
+  app.use(cors());
+  app.use(express.json());
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const server = http.createServer(app);
-
-setupWebSocket(server);
-
-initDB().then(() => {
-  server.listen(PORT, () => {
-    console.log(`🚀 PrivaChat server running on port ${PORT}`);
+  // Health check
+  app.get('/health', (req, res) => {
+    log.debug('[Health] Health check');
+    res.json({
+      status:    'ok',
+      uptime:    process.uptime(),
+      env:       config.NODE_ENV,
+      timestamp: new Date().toISOString(),
+    });
   });
-}).catch((err) => {
-  console.error('Failed to initialize database:', err);
+
+  // Routes
+  app.use('/api/auth',  authLimiter, authRoutes);
+  app.use('/api/users', usersRoutes);
+
+  // Global error handler
+  app.use((err, req, res, next) => {
+    log.error(`Unhandled error: ${err.message}`, err);
+    res.status(500).json({ error: 'Internal server error' });
+  });
+
+  const server = http.createServer(app);
+
+  const port = parseInt(config.PORT, 10);
+  server.listen(port, () => {
+    log.info(`HTTP server listening on port ${port}`);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    log.error(`Unhandled rejection: ${reason}`, reason instanceof Error ? reason : new Error(String(reason)));
+  });
+
+  process.on('uncaughtException', (err) => {
+    log.error(`Uncaught exception: ${err.message}`, err);
+    process.exit(1);
+  });
+
+  return server;
+}
+
+start().catch((err) => {
+  console.error('Fatal startup error:', err);
   process.exit(1);
 });

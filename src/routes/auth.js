@@ -1,48 +1,58 @@
-const router = require('express').Router();
+'use strict';
+
+const express = require('express');
 const bcrypt = require('bcryptjs');
-const { pool } = require('../db');
-const { signToken } = require('../middleware/auth');
+const { v4: uuidv4 } = require('uuid');
+const { query } = require('../db/pool');
+const { signAccess, signRefresh, verifyRefresh } = require('../utils/jwt');
+const createLogger = require('../utils/logger');
+const log = createLogger('Auth');
+
+const router = express.Router();
+
+const USERNAME_RE = /^[a-z0-9_]{3,32}$/;
 
 // POST /api/auth/register
 router.post('/register', async (req, res) => {
-  const { username, display_name, password, public_key } = req.body;
+  const { username, password, publicKeyX25519, publicKeyEd25519 } = req.body;
 
-  // Валидация
-  if (!username || !display_name || !password) {
-    return res.status(400).json({ error: 'username, display_name and password are required' });
+  // Validate input
+  if (!username || !USERNAME_RE.test(username)) {
+    return res.status(400).json({ error: 'Username must be 3–32 chars: a-z, 0-9, _' });
+  }
+  if (!password || password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+  if (!publicKeyX25519 || !publicKeyEd25519) {
+    return res.status(400).json({ error: 'Public keys are required' });
   }
 
-  if (!/^[a-z0-9_]{3,32}$/.test(username)) {
-    return res.status(400).json({
-      error: 'Username: only lowercase letters, numbers, underscore. 3-32 chars.'
-    });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
+  log.info(`Registration attempt: username=${username}`);
 
   try {
-    const exists = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
-    if (exists.rows.length > 0) {
-      return res.status(409).json({ error: 'Username already taken' });
-    }
+    const passwordHash = await bcrypt.hash(password, 12);
 
-    const hash = await bcrypt.hash(password, 12);
-    const result = await pool.query(
-      `INSERT INTO users (username, display_name, password_hash, public_key)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, username, display_name, public_key, avatar_url, status, created_at`,
-      [username, display_name, hash, public_key || null]
+    const result = await query(
+      `INSERT INTO users (username, password_hash, public_key_x25519, public_key_ed25519)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [username, passwordHash, publicKeyX25519, publicKeyEd25519]
     );
 
-    const user = result.rows[0];
-    const token = signToken(user.id, user.username);
+    const userId = result.rows[0].id;
+    log.info(`User registered: id=${userId} username=${username}`);
 
-    res.status(201).json({ token, user });
+    const accessToken  = signAccess(userId);
+    const refreshToken = signRefresh(userId);
+
+    return res.status(201).json({ accessToken, refreshToken, userId });
   } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ error: 'Registration failed' });
+    if (err.code === '23505') {
+      // unique_violation
+      log.warn(`Registration failed: username ${username} already taken`);
+      return res.status(409).json({ error: 'Username already taken' });
+    }
+    log.error('Registration error', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -51,63 +61,75 @@ router.post('/login', async (req, res) => {
   const { username, password } = req.body;
 
   if (!username || !password) {
-    return res.status(400).json({ error: 'username and password are required' });
+    return res.status(400).json({ error: 'Username and password are required' });
   }
 
+  log.info(`Login attempt: username=${username}`);
+
   try {
-    const result = await pool.query(
-      'SELECT * FROM users WHERE username = $1',
+    const result = await query(
+      'SELECT id, password_hash FROM users WHERE username = $1',
       [username]
     );
 
     if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      log.warn(`Login failed: username=${username} not found`);
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
     const valid = await bcrypt.compare(password, user.password_hash);
 
     if (!valid) {
-      return res.status(401).json({ error: 'Invalid username or password' });
+      log.warn(`Login failed: invalid password for username=${username}`);
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Обновляем last_seen
-    await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [user.id]);
+    // Update last_seen
+    await query('UPDATE users SET last_seen = NOW() WHERE id = $1', [user.id]);
 
-    const token = signToken(user.id, user.username);
+    log.info(`Login successful: userId=${user.id}`);
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        display_name: user.display_name,
-        public_key: user.public_key,
-        avatar_url: user.avatar_url,
-        status: user.status
-      }
-    });
+    const accessToken  = signAccess(user.id);
+    const refreshToken = signRefresh(user.id);
+
+    return res.json({ accessToken, refreshToken, userId: user.id });
   } catch (err) {
-    console.error('Login error:', err);
-    res.status(500).json({ error: 'Login failed' });
+    log.error('Login error', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// POST /api/auth/update-public-key
-const { authMiddleware } = require('../middleware/auth');
-router.post('/update-public-key', authMiddleware, async (req, res) => {
-  const { public_key } = req.body;
-  if (!public_key) return res.status(400).json({ error: 'public_key required' });
+// POST /api/auth/refresh
+router.post('/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(400).json({ error: 'Refresh token required' });
+  }
 
   try {
-    await pool.query(
-      'UPDATE users SET public_key = $1 WHERE id = $2',
-      [public_key, req.userId]
-    );
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to update key' });
+    const payload = verifyRefresh(refreshToken);
+    const userId = payload.userId;
+
+    // Update last_seen
+    await query('UPDATE users SET last_seen = NOW() WHERE id = $1', [userId]);
+
+    log.info(`Token refreshed: userId=${userId}`);
+
+    const newAccessToken  = signAccess(userId);
+    const newRefreshToken = signRefresh(userId);
+
+    return res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired refresh token' });
   }
+});
+
+// POST /api/auth/logout
+router.post('/logout', (req, res) => {
+  // Stateless — client just discards tokens
+  return res.json({ status: 'ok' });
 });
 
 module.exports = router;

@@ -1,21 +1,21 @@
 services:
   - type: web
-    name: privachat-server
+    name: secure-messenger-server
     env: node
-    plan: free
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node src/index.js
     envVars:
-      - key: NODE_ENV
-        value: production
-      - key: JWT_SECRET
-        generateValue: true
       - key: DATABASE_URL
         fromDatabase:
-          name: privachat-db
+          name: secure-messenger-db
           property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
 
 databases:
-  - name: privachat-db
+  - name: secure-messenger-db
     plan: free
-    databaseName: privachat
